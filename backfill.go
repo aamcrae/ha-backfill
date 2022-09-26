@@ -49,12 +49,13 @@ import (
 
 var baseDir = flag.String("dir", "/var/cache/MeterMan/csv", "Base directory for CSV files")
 var resetTimes = flag.String("reset", "2022-07-25 14:00", "List of times of value resets")
+var shortTerm = flag.Int("shortterm", 14, "Number of days to to keep short term stats")
 
 // metadata_id keys for the import, export and solar tables.
 // These can obtained from the statistics_meta table in the database
-var imp_key = flag.String("14", "import-key", "metadata_id key for import records")
-var exp_key = flag.String("13", "export-key", "metadata_id key for export records")
-var gen_key = flag.String("15", "gen-key", "metadata_id key for solar generation records")
+var imp_key = flag.String("import-key", "14", "metadata_id key for import records")
+var exp_key = flag.String("export-key", "13", "metadata_id key for export records")
+var gen_key = flag.String("gen-key", "15", "metadata_id key for solar generation records")
 
 // Combined format for parsing date/time
 const tFmt = "2006-01-02 15:04"
@@ -71,12 +72,14 @@ var reset = map[time.Time]bool{}
 // One statistical sample
 type sample struct {
 	t     time.Time // Sample time
+	sum float32
 	value float32   // value of sample
 }
 
-// The set of all samples for one type of statistic
+// The set of all samples for one statistic
 type stat struct {
 	last    float32  // Prior sample value (to detect resets)
+	sum float32
 	skipped int      // Number of skipped samples
 	values  []sample // List of samples
 }
@@ -124,7 +127,7 @@ func allFiles(dir string) ([]string, error) {
 	return files, err
 }
 
-// readFile reads one CSV file and extracts the hourly summary
+// readFile reads one CSV file and extracts the 60 minute and 5 minute summary
 func readFile(file string, imp, exp, gen *stat) error {
 	f, err := os.Open(file)
 	if err != nil {
@@ -186,25 +189,24 @@ func readFile(file string, imp, exp, gen *stat) error {
 			log.Printf("%s: %d: Cannot parse date (%s)", file, i+1, t)
 			continue
 		}
-		if tm.Minute() == 0 {
-			imp.addValue(data[impCol], tm)
-			exp.addValue(data[expCol], tm)
-			gen.addValue(data[genCol], tm)
-		}
+		imp.addValue(data[impCol], tm)
+		exp.addValue(data[expCol], tm)
+		gen.addValue(data[genCol], tm)
 	}
 	return nil
 }
 
 func (s *stat) addValue(str string, tm time.Time) {
 	f, err := strconv.ParseFloat(str, 64)
+	val := float32(f)
 	if err == nil && f != 0 {
-		if float32(f) < s.last && !reset[tm] {
-			// Skip samples that go backwards
-			s.skipped++
-		} else {
-			s.values = append(s.values, sample{tm, float32(f)})
-			s.last = float32(f)
+		if len(s.values) == 0 || val < s.last {
+			// Reset base.
+			s.last = val
 		}
+		s.sum += val - s.last
+		s.values = append(s.values, sample{tm, s.sum, val})
+		s.last = val
 	}
 }
 
@@ -212,22 +214,26 @@ func (s *stat) addValue(str string, tm time.Time) {
 // and to insert new records
 func (s *stat) generateSQL(key string) {
 	fmt.Printf("DELETE FROM statistics WHERE metadata_id = '%s';\n", key)
-	var sum float32
-	last := s.values[0].value
-	tf := "2006-01-02 15:04:05"
+	fmt.Printf("DELETE FROM statistics_short_term WHERE metadata_id = '%s';\n", key)
+	one_hour := time.Minute * -60
+	five_min := time.Minute * -5
+	short_term := time.Now().In(time.UTC).Add(-time.Hour * 24 * time.Duration(*shortTerm))
 	for _, v := range s.values {
 		utc := v.t.In(time.UTC)
-		// Start date/time is 1 hour before sample time
-		start := utc.Add(time.Hour * -1)
-		diff := v.value - last
-		// Check for reset of value
-		if diff < 0 {
-			last = v.value
+		if utc.Minute() == 0 {
+			v.insert("statistics", utc, one_hour, key)
 		}
-		sum += v.value - last
-		last = v.value
-		fmt.Printf("INSERT INTO statistics (created, start, state, sum, metadata_id) "+
-			"VALUES ('%s', '%s', %f, %f, '%s');\n",
-			utc.Format(tf), start.Format(tf), v.value, sum, key)
+		if utc.After(short_term) {
+			v.insert("statistics_short_term", utc, five_min, key)
+		}
 	}
+}
+
+func (v *sample) insert(table string, tm time.Time, offset time.Duration, key string) {
+	const tf = "2006-01-02 15:04:05"
+	// Start date/time is 1 sample time before create time.
+	start := tm.Add(offset)
+	fmt.Printf("INSERT INTO %s (created, start, state, sum, metadata_id) "+
+		"VALUES ('%s', '%s', %f, %f, '%s');\n",
+		table, tm.Add(time.Second * 10).Format(tf), start.Format(tf), v.value, v.sum, key)
 }
