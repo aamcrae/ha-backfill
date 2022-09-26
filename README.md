@@ -24,6 +24,6 @@ The steps to use this utility are:
 - Enjoy your updated energy graphs
 
 The utility can be customized by some flags, and also some
-costants that may be changed in the code.
+constants that may be changed in the code.
 
 This is not an officially supported Google product.
