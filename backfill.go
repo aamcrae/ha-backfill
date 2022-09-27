@@ -14,19 +14,23 @@
 
 // backfill reads the CSV files and exports the
 // historical energy values to the Home Assistant database.
-// The CSV files are assumed to be in a directory tree as:
-//  YYYY/
-//      MM/
-//         YYYY-MM-DD
+// The CSV files are assumed to be in a separate directory.
+// A directory walk is used to read the CSV files, which should
+// be in time order e.g named as yyyy-mm-dd
+// The first line of each file is assumed to be a commented header line e.g
 //
-// The MeterMan project generates CSV files of this format.
+//    #date,time,EXP,IMP,GEN-T,...
 //
-// The relevant columns that are processed are:
+// This header line is used to identify the columns to be used.
+//
+// The relevant column titles that are processed are:
 // date - to get the date
 // time - Only values on the hour are processed
 // IMP - Accumlating imported energy (kWh)
 // EXP - Accumlating exported energy (kWh)
 // GEN-T - Accumlating solar generation (kWh)
+//
+// The MeterMan project generates CSV files of this format.
 //
 // Once the CSV files are processed, SQL is generated
 // that can be applied to the home assistant database.
@@ -43,12 +47,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 )
 
 var baseDir = flag.String("dir", "/var/cache/MeterMan/csv", "Base directory for CSV files")
-var resetTimes = flag.String("reset", "2022-07-25 14:00", "List of times of value resets")
 var shortTerm = flag.Int("shortterm", 14, "Number of days to to keep short term stats")
 
 // metadata_id keys for the import, export and solar tables.
@@ -57,7 +59,7 @@ var imp_key = flag.String("import-key", "14", "metadata_id key for import record
 var exp_key = flag.String("export-key", "13", "metadata_id key for export records")
 var gen_key = flag.String("gen-key", "15", "metadata_id key for solar generation records")
 
-// Combined format for parsing date/time
+// Format for parsing combined date/time
 const tFmt = "2006-01-02 15:04"
 
 // CSV column headers
@@ -67,43 +69,31 @@ const h_import = "IMP"
 const h_export = "EXP"
 const h_gen = "GEN-T"
 
-var reset = map[time.Time]bool{}
-
 // One statistical sample
 type sample struct {
 	t     time.Time // Sample time
-	sum float32
+	sum   float32   // Running sum
 	value float32   // value of sample
 }
 
 // The set of all samples for one statistic
 type stat struct {
-	last    float32  // Prior sample value (to detect resets)
-	sum float32
-	skipped int      // Number of skipped samples
-	values  []sample // List of samples
+	last   float32  // Prior sample value (to detect resets)
+	total  float32  // Accumulating total
+	values []sample // List of samples
 }
 
 func main() {
 	flag.Parse()
 
-	if len(*resetTimes) != 0 {
-		for _, s := range strings.Split(*resetTimes, ",") {
-			t, err := time.ParseInLocation(tFmt, s, time.Local)
-			if err != nil {
-				log.Fatalf("%s: %v", s, err)
-			}
-			reset[t] = true
-		}
-	}
-	files, err := allFiles(*baseDir)
+	files, err := getFileNames(*baseDir)
 	if err != nil {
 		log.Fatalf("%s: %v", *baseDir, err)
 	}
-	sort.Strings(files)
 	var imp, exp, gen stat
+	// Iterate through all the files in time order, and read the CSV data.
 	for _, f := range files {
-		err := readFile(f, &imp, &exp, &gen)
+		err := readCSV(f, &imp, &exp, &gen)
 		if err != nil {
 			log.Printf("%s: %v\n", f, err)
 			continue
@@ -114,7 +104,9 @@ func main() {
 	gen.generateSQL(*gen_key)
 }
 
-func allFiles(dir string) ([]string, error) {
+// getFileNames walks the directory and returns all the files,
+// in sorted order.
+func getFileNames(dir string) ([]string, error) {
 	var files []string
 
 	err := filepath.Walk(dir,
@@ -124,11 +116,12 @@ func allFiles(dir string) ([]string, error) {
 			}
 			return err
 		})
+	sort.Strings(files)
 	return files, err
 }
 
-// readFile reads one CSV file and extracts the 60 minute and 5 minute summary
-func readFile(file string, imp, exp, gen *stat) error {
+// readCSV reads one CSV file and extracts the samples
+func readCSV(file string, imp, exp, gen *stat) error {
 	f, err := os.Open(file)
 	if err != nil {
 		return err
@@ -138,11 +131,12 @@ func readFile(file string, imp, exp, gen *stat) error {
 	if err != nil {
 		return err
 	}
+	// File must contain at least a header line and one line of data
 	if len(r) < 2 {
 		log.Printf("%s: empty file", file)
 		return nil
 	}
-	// Find columns
+	// Find columns in header line
 	dateCol := -1
 	timeCol := -1
 	impCol := -1
@@ -189,23 +183,30 @@ func readFile(file string, imp, exp, gen *stat) error {
 			log.Printf("%s: %d: Cannot parse date (%s)", file, i+1, t)
 			continue
 		}
-		imp.addValue(data[impCol], tm)
-		exp.addValue(data[expCol], tm)
-		gen.addValue(data[genCol], tm)
+		if impCol != -1 {
+			imp.addValue(data[impCol], tm)
+		}
+		if expCol != -1 {
+			exp.addValue(data[expCol], tm)
+		}
+		if genCol != -1 {
+			gen.addValue(data[genCol], tm)
+		}
 	}
 	return nil
 }
 
+// addValue will append one value to this stat's list of values.
 func (s *stat) addValue(str string, tm time.Time) {
 	f, err := strconv.ParseFloat(str, 64)
 	val := float32(f)
 	if err == nil && f != 0 {
 		if len(s.values) == 0 || val < s.last {
-			// Reset base.
+			// Reset base if first item or value has gone backwards
 			s.last = val
 		}
-		s.sum += val - s.last
-		s.values = append(s.values, sample{tm, s.sum, val})
+		s.total += val - s.last
+		s.values = append(s.values, sample{tm, s.total, val})
 		s.last = val
 	}
 }
@@ -229,11 +230,13 @@ func (s *stat) generateSQL(key string) {
 	}
 }
 
+// insert generates the SQL to insert a record into the selected table
 func (v *sample) insert(table string, tm time.Time, offset time.Duration, key string) {
 	const tf = "2006-01-02 15:04:05"
 	// Start date/time is 1 sample time before create time.
+	// Create time is offset by 10 seconds (to match what home assistant recorder does)
 	start := tm.Add(offset)
 	fmt.Printf("INSERT INTO %s (created, start, state, sum, metadata_id) "+
 		"VALUES ('%s', '%s', %f, %f, '%s');\n",
-		table, tm.Add(time.Second * 10).Format(tf), start.Format(tf), v.value, v.sum, key)
+		table, tm.Add(time.Second*10).Format(tf), start.Format(tf), v.value, v.sum, key)
 }
